@@ -1,0 +1,261 @@
+import 'dart:async';
+import 'dart:math';
+
+import 'package:app/src/phoenix_channel_client/phoenix_channel.dart';
+import 'package:app/src/phoenix_channel_client/phoenix_connection.dart';
+import 'package:app/src/phoenix_channel_client/phoenix_io_connection.dart';
+import 'package:app/src/phoenix_channel_client/phoenix_message.dart';
+import 'package:app/src/phoenix_channel_client/phoenix_serializer.dart';
+import 'package:app/src/phoenix_channel_client/phoenix_socket_options.dart';
+
+class PhoenixSocket {
+  Uri? _endpoint;
+  final _StateChangeCallbacks _stateChangeCallbacks = _StateChangeCallbacks();
+
+  List<int> reconnectAfterMs = const [1000, 2000, 5000, 10000];
+  int _ref = 0;
+
+  // exit flag to abort connect loop
+  bool _connecting = false;
+
+  final _encode = PhoenixSerializer.encode;
+  final _decode = PhoenixSerializer.decode;
+  Timer? _heartbeatTimer;
+  String? _pendingHeartbeatRef;
+  List<Function()> _sendBuffer = [];
+  List<PhoenixChannel> channels = [];
+
+  bool _reconnect = false;
+
+  PhoenixConnection? _conn;
+  PhoenixConnection? get conn => _conn;
+
+  int timeout = 10000;
+  PhoenixSocketOptions _options = PhoenixSocketOptions();
+  PhoenixConnectionProvider _connectionProvider = PhoenixIoConnection.provider;
+
+  /// Creates an instance of PhoenixSocket
+  ///
+  /// endpoint is the full url to which you wish to connect e.g. `ws://localhost:4000/websocket/socket`
+  PhoenixSocket(String endpoint,
+      {socketOptions = PhoenixSocketOptions,
+      connectionProvider = PhoenixConnectionProvider}) {
+    if (socketOptions is PhoenixSocketOptions) {
+      _options = socketOptions;
+    }
+
+    if (connectionProvider is PhoenixConnectionProvider) {
+      _connectionProvider = connectionProvider;
+    }
+
+    _buildEndpoint(endpoint);
+  }
+
+  _buildEndpoint(endpoint) {
+    var decodedUri = Uri.parse(endpoint);
+
+    _endpoint = Uri(
+        scheme: decodedUri.scheme,
+        host: decodedUri.host,
+        path: decodedUri.path,
+        port: decodedUri.port,
+        queryParameters: _options.params);
+  }
+
+  Uri? get endpoint => _endpoint;
+  int get ref => _ref;
+  bool get isConnected => _conn?.isConnected ?? false;
+  int get connectionState => _conn?.readyState ?? 3; // WebSocket CLOSED
+  int get sendBufferLength => _sendBuffer.length;
+
+  /// [topic] is the name of the channel you wish to join
+  /// [params] are any options parameters you wish to send
+  PhoenixChannel channel(String topic, [Map params = const {}]) {
+    final channel = PhoenixChannel(topic, params, this);
+    channels.add(channel);
+    return channel;
+  }
+
+  remove(PhoenixChannel channelToRemove) {
+    channels.removeWhere((chan) => chan.joinRef == channelToRemove.joinRef);
+  }
+
+  /// Attempts to make a WebSocket connection to your backend
+  ///
+  /// If the attempt fails, retries will be triggered at intervals specified
+  /// by retryAfterIntervalMS
+  connect() async {
+    if (_conn != null) {
+      return;
+    }
+
+    _connecting = true;
+
+    for (int tries = 0; _conn == null && _connecting; tries += 1) {
+      try {
+        _conn = _connectionProvider(_endpoint.toString());
+        await _conn!.waitForConnection();
+      } catch (reason) {
+        _conn = null;
+
+        var wait = reconnectAfterMs[min(tries, reconnectAfterMs.length - 1)];
+        await Future.delayed(Duration(milliseconds: wait));
+
+        continue;
+      }
+
+      _reconnect = true;
+      _onConnOpened();
+
+      if (_conn != null) {
+        _conn!
+          ..onClose(reconnect)
+          ..onMessage(_onConnMessage)
+          ..onError(_onConnectionError);
+      }
+    }
+  }
+
+  /// Add a callback to be executed when the connection is successfully made
+  onOpen(Function() callback) => _stateChangeCallbacks.open.add(callback);
+
+  /// Add a callback to be executed when the connection is closed
+  onClose(Function(dynamic) callback) =>
+      _stateChangeCallbacks.close.add(callback);
+
+  /// Add a callback to be executed if an error occurs
+  onError(Function(dynamic) callback) =>
+      _stateChangeCallbacks.error.add(callback);
+
+  /// Add a callback for when a message is received
+  onMessage(Function(PhoenixMessage) callback) =>
+      _stateChangeCallbacks.message.add(callback);
+
+  _onConnOpened() async {
+    _flushSendBuffer();
+    _heartbeatTimer = Timer.periodic(
+        Duration(milliseconds: _options.heartbeatIntervalMs), sendHeartbeat);
+    for (var cb in _stateChangeCallbacks.open) {
+      cb();
+    }
+  }
+
+  void _onConnClosed(message) {
+    _heartbeatTimer?.cancel();
+    _triggerChannelErrors();
+    for (var cb in _stateChangeCallbacks.close) {
+      cb(message);
+    }
+  }
+
+  void _onConnectionError(error) {
+    _triggerChannelErrors();
+    for (var cb in _stateChangeCallbacks.error) {
+      cb(error);
+    }
+  }
+
+  void _onConnMessage(String? rawJSON) {
+    final message = _decode(rawJSON);
+
+    if (_pendingHeartbeatRef != null && message.ref == _pendingHeartbeatRef) {
+      _pendingHeartbeatRef = null;
+    }
+
+    List.from(channels)
+        .where((channel) => channel.isMember(
+            message.topic, message.event, message.payload, message.joinRef))
+        .forEach((channel) => channel.trigger(
+            message.event, message.payload, message.ref, message.joinRef));
+    for (var callback in _stateChangeCallbacks.message) {
+      callback(message);
+    }
+  }
+
+  /// In the event of a network dropout or other error, attempt to reconnect
+  reconnect() {
+    _onConnClosed(null);
+    _conn = null;
+    if (_reconnect) {
+      connect();
+    }
+  }
+
+  /// Terminates the socket connection with an optional [code]
+  disconnect({int code = PhoenixConnection.closeNormal}) {
+    _heartbeatTimer?.cancel();
+    _reconnect = false;
+
+    // abort any connecting loop
+    _connecting = false;
+
+    if (_conn == null) {
+      return;
+    }
+
+    _conn!.close(code);
+    _conn = null;
+  }
+
+  void _flushSendBuffer() {
+    if (isConnected) {
+      for (var callback in _sendBuffer) {
+        callback();
+      }
+      _sendBuffer = [];
+    }
+  }
+
+  void _triggerChannelErrors() {
+    for (var channel in channels) {
+      channel.triggerError();
+    }
+  }
+
+  void stopHeartbeat() {
+    _heartbeatTimer?.cancel();
+  }
+
+  /// @nodoc
+  void sendHeartbeat(Timer timer) {
+    if (_conn == null || !_conn!.isConnected) {
+      return;
+    }
+
+    if (_pendingHeartbeatRef != null) {
+      _pendingHeartbeatRef = null;
+      _conn!.closeNormally("Heartbeat timeout");
+      return;
+    }
+    _pendingHeartbeatRef = makeRef();
+
+    push(PhoenixMessage.heartbeat(_pendingHeartbeatRef));
+  }
+
+  /// Pushes a message to the server
+  void push(PhoenixMessage msg) {
+    callback() {
+      final encoded = _encode(msg);
+      _conn!.send(encoded);
+    }
+
+    if (isConnected) {
+      callback();
+    } else {
+      _sendBuffer.add(callback);
+    }
+  }
+
+  String makeRef() {
+    _ref++;
+    return "$_ref";
+  }
+}
+
+class _StateChangeCallbacks {
+  List<Function()> open = [];
+  List<Function(dynamic error)> close = [], error = [];
+  List<Function(PhoenixMessage)> message = [];
+
+  _StateChangeCallbacks();
+}
