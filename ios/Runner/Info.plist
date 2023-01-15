@@ -47,5 +47,22 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>FlutterDeepLinkingEnabled</key>
+	<true/>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+		<key>CFBundleTypeRole</key>
+		<string>Editor</string>
+		<key>CFBundleURLName</key>
+		<string>repcounter.com</string>
+		<key>CFBundleURLSchemes</key>
+		<array>
+		<string>workouts</string>
+		</array>
+		</dict>
+	</array>
+	<key>NFCReaderUsageDescription</key>
+	<string>Use your phones NFC capabilities to connect to machines and track your workouts.</string>
 </dict>
 </plist>
